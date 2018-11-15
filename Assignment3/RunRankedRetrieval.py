@@ -1,118 +1,116 @@
 import re
 import json
-from collections import Counter
-from math import log10, sqrt
 from UseIndex import UseIndex
+from math import log10, sqrt
 
-def extract_terms_from_query(query):
-    query = re.sub('([^\w\d])', ' ', query)
+def get_term_from_query(query):
+    query = query.lower()
     terms = query.split(' ')
-    return [term.lower() for term in terms if term]
-
+    return terms
+    
+def normalize_vector(vector):
+    total=0
+    result={}
+    for term, val in vector.items():
+        total = total+val*val
+    size = sqrt(total)
+    if size == 0:
+        return vector
+    else:
+        for term, value in vector.items():
+            result[term] = value/size
+        return result
+    
+def get_cosine_similarity(vector1, vector2):
+    score = 0
+    contributions = {}
+    for term, value in vector1.items():
+        score += vector2[term]*value
+        contributions[term] = value
+    return score, contributions
 
 class RankedRetrieval(object):
-    def __init__(self, index_folder_name, content_folder):
-        term_id_path, doc_id_path, inverted_index_path = \
-            ["{}/{}".format(index_folder_name, file_name)
-             for file_name in ['TermIDFile.txt', 'DocumentIDFile.txt', 'InvertedIndex.json']]
+    def __init__(self, IndexFolderName_path, ContentFolderName_path):
+        self.IndexFolderName_path=IndexFolderName_path
+        self.use_index = UseIndex(IndexFolderName_path+"/DocumentIDFile.txt", IndexFolderName_path+"/TermIDFile.txt", IndexFolderName_path+"/InvertedIndex.json")
+        self.ContentFolderName_path = ContentFolderName_path
 
-        self.inverted_index = UseIndex(term_id_path, doc_id_path, inverted_index_path)
-        self.content_folder = content_folder
-        self.N = len(self.inverted_index.doc_id_dict)
+    def process_query_normalized_tf_idf_weighted(self, query):
+        terms = get_term_from_query(query)
+        query_lengths = {}
+        term_set=set()
+        for term in terms:
+            if term in term_set:
+                query_lengths[term]+=1
+            else:
+                query_lengths[term]=1
+                term_set.add(term)
+        term_vector = {}
+        for term, fre in query_lengths.items():
+            tf = log10(fre)+1
+            df = int(self.use_index.get_term_fre(term))
+            if df == 0:
+                idf = 0
+            else:
+                idf = log10((len(self.use_index.file_record))/df)
+            term_vector[term] = tf * idf
+        return normalize_vector(term_vector)
 
-    # Given a query string, returns a normalized, weighted tf-idf query vector
-    def tf_idf_query(self, query):
-        terms = extract_terms_from_query(query)
-        term_counts = dict(Counter(terms))
-        tf_idf = {}
-
-        for term, term_freq in term_counts.items():
-            tf = 1 + log10(term_freq)
-            df = int(self.inverted_index.get_term_doc_freq(term))
-            idf = log10(self.N/df) if df != 0 else 0
-            tf_idf[term] = tf * idf
-
-        return normalize_vector(tf_idf)
-
-    # Given a query string and a doc_id, returns a normalized, weighted tf-idf document vector
-    def tf_idf_doc(self, query, doc_id):
-        terms = extract_terms_from_query(query)
-        tf_idf = {}
-
+    def process_file_normalized_tf_idf_weighted(self, query, id_doc):
+        terms = get_term_from_query(query)
+        file_vector = {}
         for term in terms:
             idf = 1
-            doc_freq = self.inverted_index.get_term_freq_in_doc(term, doc_id)
-            tf_idf[term] = 0 if doc_freq == 0 else (1 + log10(doc_freq)) * idf
-
-        return normalize_vector(tf_idf)
-
-    def get_top_k_docs(self, query, k):
-        doc_id_to_doc_info = {}
-
-        vector_query = self.tf_idf_query(query)
-        for doc_id in self.inverted_index.doc_id_dict:
-            vector_doc = self.tf_idf_doc(query, doc_id)
-            score, contribution_dict = cosine_similarity(vector_query, vector_doc)
-
-            doc_id_to_doc_info[doc_id] = [score, contribution_dict]
-
-        sorted_dict = sorted(doc_id_to_doc_info.items(), key=lambda kv_pair: kv_pair[1][0], reverse=True)
-        top_k_entries = {doc_id: doc_info for (doc_id, doc_info) in sorted_dict[:k]}
-
-        # {doc_id => [score, contribution_dict, doc_name, doc_snippet]}
-        for doc_id, doc_info in top_k_entries.items():
-            top_k_entries[doc_id].append(self.inverted_index.get_doc_name_from_id(doc_id))
-            top_k_entries[doc_id].append(self.get_doc_snippet(doc_id, self.content_folder))
-
-        return top_k_entries
-
-    # Given the path to crawled html files and a doc_id, returns a snippet of the html content
-    def get_doc_snippet(self, doc_id, html_path):
-        noises_regex = ['(<script.*?>[\s\S]*?</script>)',
-                        '(<style.*?>[\s\S]*?</style>)',
-                        '(<.+?>)|(</[\s\S]*?>)',
-                        '(<!--[\s\S]*?-->)',
-                        ]
-        doc_name = self.inverted_index.get_doc_name_from_id(doc_id)
-        content = open('{}/{}'.format(html_path, doc_name), 'r').read()
+            fre = self.use_index.get_term_freq_file(term, id_doc)
+            if fre == 0:
+                file_vector[term] = 0
+            else:
+                file_vector[term] = idf*(1 + log10(fre))
+        return normalize_vector(file_vector)
+    
+    def generate_snippet(self, id_doc, file_name):
+        content = open(file_name, 'r').read()
+        # get valid content in valid format
         content = re.compile('(<div id="mw-content-text" [\s\S]*)</div>',).findall(content)[0]
-        for regexp in noises_regex:
-            content = re.sub(regexp, '', content)
-
+        need_skip = ['(<script.*?>[\s\S]*?</script>)','(<style.*?>[\s\S]*?</style>)','(<.+?>)|(</[\s\S]*?>)',
+        '(<!--[\s\S]*?-->)','\n',]
+        for skip in need_skip:
+            #replace skips
+            content = re.sub(skip, '', content)
         return content[:200]
 
+    def top_k_files(self, query, k):
+        file_scores= {}
+        query_vector = self.process_query_normalized_tf_idf_weighted(query)
+        for id_doc in self.use_index.file_record:
+            vector_doc = self.process_file_normalized_tf_idf_weighted(query, id_doc)
+            score, contributions = get_cosine_similarity(query_vector, vector_doc)
+            file_scores[id_doc] = [score, contributions]
 
-# Given two vectors, returns the cosine similarity score between them and
-# a dict containing contribution of score each term to the cosine score
-def cosine_similarity(vector_dict1, vector_dict2):
-    score = 0
-    contribution_dict = {}
+        file_scores = sorted(file_scores.items(), key=lambda kv_pair: kv_pair[1][0], reverse=True)
+        file_scores=file_scores[:k]
+        result={}
+        for id_doc, value in file_scores:
+            result[id_doc] = value
 
-    for term, val in vector_dict1.items():
-        score += val * vector_dict2[term]
-        contribution_dict[term] = val
+        for id_doc, value in result.items():
+            file_name = self.use_index.get_file_name_by_id(id_doc)
+            result[id_doc].append(file_name)
+            result[id_doc].append(self.generate_snippet(id_doc, (self.ContentFolderName_path)+"/"+file_name))
 
-    return score, contribution_dict
-
-
-def normalize_vector(dict_vector):
-    size = sqrt(sum([val*val for term, val in dict_vector.items()]))
-    return {term: val/size for term, val in dict_vector.items()} if size != 0 else dict_vector
+        return result
 
 #main function
-def run_ranked_retrieval(index_folder_name, content_folder_name, queries_file, k):
-    rr = RankedRetrieval(index_folder_name, content_folder_name)
-    raw_queries = open(queries_file, 'r').read().split('\n')
-
-    # output = { raw_query => [trans_query, top_k_entries] }
-    # top_k_entries = { doc_id => [score, contribution_dict, doc_name, doc_snippet] }
-    output = {}
-    for raw_query in raw_queries:
-        terms = extract_terms_from_query(raw_query)
-        query = ' '.join(terms)
-        output[raw_query] = [query, rr.get_top_k_docs(raw_query, k)]
-
-    with open('Output.json', 'w') as output_file:
-        output_file.write(json.dumps(output, indent=2))
+def run_ranked_retrieval(IndexFolderName_path, ContentFolderName_path, queries_path, k):
+    ranked_retrieval = RankedRetrieval(IndexFolderName_path, ContentFolderName_path)
+    queries = open(queries_path, 'r').read().split('\n')
+    result = {}
+    for query in queries:
+        terms = get_term_from_query(query)
+        top_k=ranked_retrieval.top_k_files(query, k)
+        result[query] = [query, top_k]
+    out_file_name='Output.txt'
+    f = open(out_file_name, "w+")
+    f.write(json.dumps(result, indent=2))
 
 run_ranked_retrieval('IndexFolderName', 'ContentFolderName', 'Queries.txt', 5)
